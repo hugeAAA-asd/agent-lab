@@ -220,12 +220,15 @@ def run(user_input, max_steps=MAX_STEPS):
     for step in range(1, max_steps + 1):
         messages = trim_by_turn(messages, KEEP_MSG)
         data = call_llm(messages)
+        finish = data["choices"][0].get("finish_reason")
         msg = data["choices"][0]["message"]
         msg.pop("reasoning_content", None)      # DeepSeek 特有字段，回传会报错
 
         tool_calls = msg.get("tool_calls")
         if not tool_calls:
-            print(f"[step {step}] ✓ 模型给出最终答案，循环结束")
+            print(f"[step {step}] finish_reason = {finish}")
+            if finish == "length":
+                return "【截断】回答超出长度上限，只生成了一部分。请把问题拆小一点。"
             return msg.get("content") or "(空)"
 
         print(f"[step {step}] 模型要求调用 {len(tool_calls)} 个工具")
