@@ -3,3 +3,6 @@
 __pycache__/
 *.pyc
 .idea/
+
+# 临时练习草稿
+write.py

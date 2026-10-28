@@ -47,14 +47,30 @@ def dispatch(name, args):
         raise ValueError(f"未知工具: {name}")
     return fn(args)
 
+def group_by_turn(messages):
+    groups = []
+    for m in messages:
+        if m["role"] == "tool":
+           groups[-1].append(m)       # 丢进上一组
+        else:
+            groups.append([m])      # 自己开一组
+    return groups
 
-def trim_messages(messages, keep):
-    if len(messages) <= keep + 1:
-        return messages
-    # 隐患（面试可讲）：简单按条数裁剪，会把 tool 消息和它的
-    # assistant(tool_calls) 父消息拆散，API 直接 400。
-    # 正确做法是按「assistant + 它所有 tool」成组裁剪。
-    return [messages[0]] + messages[-keep:]
+def take_last(groups, keep):
+    count = 0
+    picked = []
+    for i in reversed(groups):
+        if count >= keep:
+            break
+        picked = i + picked
+        count += len(i)
+    return picked
+
+def trim_by_turn(messages, keep):
+    system = messages[0]                    # 第一条单独拎出来
+    groups = group_by_turn(messages[1:])          # 剩下的分组
+    picked = take_last(groups,keep)              # 从后往前取够 keep 条
+    return [system] + picked
 
 
 def safe_args(raw):
@@ -202,7 +218,7 @@ def run(user_input, max_steps=MAX_STEPS):
     ]
 
     for step in range(1, max_steps + 1):
-        messages = trim_messages(messages, KEEP_MSG)
+        messages = trim_by_turn(messages, KEEP_MSG)
         data = call_llm(messages)
         msg = data["choices"][0]["message"]
         msg.pop("reasoning_content", None)      # DeepSeek 特有字段，回传会报错
