@@ -38,7 +38,7 @@
 - **`role=tool` 消息必须排在它的 `assistant` 之后。** `tool_call_id` 是模型在那条 assistant 的 `tool_calls` 里生成的，服务端会校验每条 tool 消息的 `tool_call_id` 在上文出现过。顺序反了直接 400，而且模型根本没收到请求——是服务端在发出前退件。
 - **DeepSeek 返回的 `reasoning_content` 不能原样回传。** 第二轮请求会报错，必须先从 message 里剔掉。
 - **工具异常不能往外抛。** 抛出去整个 Agent 就崩了；转成文本回灌，模型拿到错误信息后能换参数或换工具。
-- **按条数裁剪历史会把父子消息拆散。** 简单 `messages[-N:]` 可能切掉 assistant 只留下 tool，下一轮同样 400。正确做法是按「assistant + 它所有 tool」成组裁剪，见 `验收记录.md`。
+- **按条数裁剪历史会把父子消息拆散。** 简单 `messages[-N:]` 可能切掉 assistant 只留下 tool，下一轮同样 400。已改为按「回合」裁剪（`group_by_turn` / `take_last` / `trim_by_turn`），见 `验收记录.md`。
 - **MCP Python SDK 2.x 里 `FastMCP` 已改名为 `MCPServer`**，字段也蛇形化了（`server_info` / `input_schema` / `is_error`），网上大量 1.x 教程照抄会报错。
 - **Windows 上 `npx` 必须写 `npx.cmd`。** `npx` 是脚本不是可执行文件，Python 的 `CreateProcess` 认不出，报 `WinError 2`。
 
@@ -59,7 +59,7 @@
 ## 已知局限
 
 - 工具串行执行，没有并发
-- 消息裁剪目前按条数，未实现成组裁剪（见上文坑）
+- 裁剪以「回合」为最小单位，所以结果可能超过 `KEEP_MSG` 条（按组取整，宁可多留也不拆）
 - 无流式输出
 - 天气工具是假数据，未接真实 API
 - 无持久化记忆

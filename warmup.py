@@ -35,6 +35,10 @@ def dispatch(name, args):
 
 
 # ---------- 2. 消息裁剪：保留第 0 条 + 最后 keep 条 ----------
+# 注意：这是最朴素的一版，留着当「改之前」的对照。
+# 它会按条数一刀切，把 tool 消息和它的 assistant(tool_calls) 父消息拆散，
+# 服务端按 tool_call_id 找不到父消息就返回 400。
+# 真正在跑的实现见 react_loop.py 的 group_by_turn / take_last / trim_by_turn。
 def trim_messages(messages, keep):
     if len(messages) <= keep + 1:
         return messages

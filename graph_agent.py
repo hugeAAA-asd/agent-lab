@@ -48,13 +48,41 @@ def dispatch(name, args):
     return fn(args)
 
 
-def trim_messages(messages, keep):
-    if len(messages) <= keep + 1:
-        return messages
-    # 隐患（面试可讲）：简单按条数裁剪，会把 tool 消息和它的
-    # assistant(tool_calls) 父消息拆散，API 直接 400。
-    # 正确做法是按「assistant + 它所有 tool」成组裁剪。
-    return [messages[0]] + messages[-keep:]
+def group_by_turn(messages):
+    """把消息切成回合：assistant(tool_calls) + 它后面连续的 tool 算一组。"""
+    groups = []
+    for m in messages:
+        if m["role"] == "tool":
+            groups[-1].append(m)        # 丢进上一组
+        else:
+            groups.append([m])          # 自己开一组
+    return groups
+
+
+def take_last(groups, keep):
+    """从后往前按组捡，消息条数攒够 keep 就停，保持原顺序。"""
+    count = 0
+    picked = []
+    for g in reversed(groups):
+        if count >= keep:
+            break
+        picked = g + picked
+        count += len(g)
+    return picked
+
+
+def trim_by_turn(messages, keep):
+    """按回合裁剪：system 始终保留，assistant 和它的 tool 不会被拆开。
+
+    旧版 trim_messages 按条数一刀切（messages[-keep:]），会把
+    assistant(tool_calls) 和它后面的 tool 拆散，服务端按 tool_call_id
+    找不到父消息，直接 400。这里改成以「回合」为最小裁剪单位。
+    代价：结果可能超过 keep 条（按组取整，宁可多留也不拆）。
+    """
+    system = messages[0]
+    groups = group_by_turn(messages[1:])
+    picked = take_last(groups, keep)
+    return [system] + picked
 
 
 def safe_args(raw):
@@ -217,7 +245,7 @@ class AgentState(TypedDict):
 
 def agent_node(state):
     """节点 A：调模型。输入 state，输出要追加的消息。"""
-    messages = trim_messages(state["messages"], KEEP_MSG)
+    messages = trim_by_turn(state["messages"], KEEP_MSG)
     data = call_llm(messages)
     msg = data["choices"][0]["message"]
     msg.pop("reasoning_content", None)
