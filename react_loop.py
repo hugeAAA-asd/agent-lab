@@ -90,19 +90,25 @@ TOOLS_SCHEMA = [
 ]
 
 
-def call_llm(messages: list[dict[str, Any]]) -> dict[str, Any]:
-    """请求 DeepSeek chat/completions；仅在实际调用时要求 API Key。"""
+def call_llm(messages: list[dict[str, Any]], with_tools: bool = True) -> dict[str, Any]:
+    """请求 DeepSeek chat/completions；仅在实际调用时要求 API Key。
+
+    with_tools=False 是给「收尾」用的：轮次用尽后只想要一段自然语言，
+    这时再把 tools 递过去，模型很可能又发起一轮工具调用，等于白转。
+    """
     if not API_KEY:
         raise RuntimeError("未配置 DEEPSEEK_API_KEY，请复制 .env.example 为 .env 后填写")
+    payload: dict[str, Any] = {
+        "model": MODEL,
+        "messages": messages,
+        "temperature": 0.3,
+    }
+    if with_tools:
+        payload["tools"] = TOOLS_SCHEMA
+        payload["tool_choice"] = "auto"
     response = requests.post(
         URL,
-        json={
-            "model": MODEL,
-            "messages": messages,
-            "temperature": 0.3,
-            "tools": TOOLS_SCHEMA,
-            "tool_choice": "auto",
-        },
+        json=payload,
         headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
         timeout=60,
     )

@@ -25,7 +25,9 @@
 三条链路都包含以下边界处理：
 
 - 工具异常转换为 `role=tool` 消息回灌，避免一次工具失败直接终止 Agent。
-- 通过最大模型调用轮数或 LangGraph `recursion_limit` 限制无限循环。
+- 轮次上限由状态里的 `steps` 承担，用尽后进入 `finalize` 节点：先补跑尚未执行的工具，再基于已有信息作答；`recursion_limit` 只作为框架层兜底。
+- 同工具同参数的重复调用在工具节点直接拦截，回一条提示而不是重复执行。
+- 轮次掐断时会出现没有配对的 `assistant(tool_calls)`，请求前统一清理，避免 400。
 - 按完整回合裁剪历史，避免孤立的 `tool` 消息找不到对应的 `assistant(tool_calls)`。
 - 模型因 `finish_reason="length"` 停止且没有工具调用时，明确返回截断提示。
 
