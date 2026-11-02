@@ -45,8 +45,8 @@ DEFAULT_WORKER_INSTRUCTION = "按总任务自行决定这一步做什么"
 
 AGENTS: dict[str, dict[str, Any]] = {
     "researcher": {
-        "desc": "查事实：天气、当前时间、读本地文件、列目录",
-        "tools": ["get_weather", "get_current_time", "read_file", "list_dir"],
+        "desc": "查事实：天气、当前时间、读本地文件、列目录、查演示数据库（只读 SQL）",
+        "tools": ["get_weather", "get_current_time", "read_file", "list_dir", "sql_query"],
         "prompt": """你是研究员，只负责查事实。
 规则：
 1. 需要事实就调用工具，不要凭记忆回答。

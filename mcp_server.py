@@ -83,6 +83,13 @@ def list_dir(path: str = ".") -> str:
     return T.list_dir(path)
 
 
+# description 复用 tools_core 里那一份，保证模型看到的表结构和真实表结构是同一段文字
+@mcp.tool(description=T.SQL_TOOL_DOC)
+@safe
+def sql_query(sql: str) -> str:
+    return T.sql_query(sql)
+
+
 if __name__ == "__main__":
     # transport="stdio"：客户端启动这个进程，通过 stdin/stdout 收发 JSON-RPC
     # 另两种是 "sse" / "streamable-http"，用于远程部署

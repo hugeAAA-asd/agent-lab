@@ -70,6 +70,13 @@ def test_tool_exception_is_returned_as_tool_message() -> None:
     assert "未知工具" in result[0]["content"]
 
 
-def test_handwritten_schema_contains_five_tools() -> None:
+def test_handwritten_schema_contains_six_tools() -> None:
     names = {item["function"]["name"] for item in react_loop.TOOLS_SCHEMA}
-    assert names == {"get_current_time", "calculate", "get_weather", "read_file", "list_dir"}
+    assert names == {
+        "get_current_time",
+        "calculate",
+        "get_weather",
+        "read_file",
+        "list_dir",
+        "sql_query",
+    }

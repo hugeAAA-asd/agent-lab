@@ -12,7 +12,7 @@
 | 模块 | 覆盖点 |
 |---|---|
 | `context.py` | system 保留、回合完整、消息顺序、超过条数预算的边界 |
-| `tools_core.py` | 正常分发、未知工具、非法参数、非法表达式、文件与目录错误 |
+| `tools_core.py` | 正常分发、未知工具、非法参数、非法表达式、文件与目录错误；`sql_query` 的只读拦截、多语句、行数截断、空结果、表名错误，以及「工具说明里的列 = 真表的列」 |
 | `react_loop.py` | 正常结束、输出截断、工具异常回灌、最大轮数兜底 |
 | `graph_agent.py` | 条件边、消息 reducer、图执行上限 |
 | `mcp_agent.py` | MCP schema 转换、正常结果、`is_error` 与调用异常回灌 |
@@ -28,7 +28,7 @@ pytest
 
 测试不读取 `.env`，也不会请求 DeepSeek。
 
-2026-11-02 本地结果：**61 项测试通过**，Ruff 静态检查与格式检查通过。另行运行 `python mcp_client.py`，本地 MCP Server 成功返回 5 个工具，正常调用与预期错误路径均符合协议。
+2026-11-02 本地结果：**75 项测试通过**，Ruff 静态检查与格式检查通过。另行运行 `python mcp_client.py`，本地 MCP Server 成功返回 6 个工具（含运行时新增的 `sql_query`），正常调用与预期错误路径均符合协议。
 
 ## 人工用例
 
@@ -42,6 +42,7 @@ pytest
 | 轮数上限 | 设置 `max_steps=1`，提出需要多步的问题 | 补跑未执行的工具后降级作答，不再抛 `GraphRecursionError` |
 | 多智能体分工 | 查一下北京的天气，再把温度和 10 相加 | 三单：researcher 只报「多云 18℃」，calculator 用工具算出 28，writer 整合 |
 | 多智能体上限 | `max_rounds=1`，要求分别查两个城市并换算 | 第二轮不再请求模型，直接转 writer 用已有账本收口，答案不为空 |
+| 查数据库 | 哪个品类卖得最好？销售额是多少 | 模型自己写出 `JOIN products` + `GROUP BY`，还主动加了 `WHERE status='paid'`，并在答案里说明「只统计已付款」。实测一次工具调用即完成 |
 
 ## 已验证的关键边界
 
@@ -72,7 +73,20 @@ MCP stdio 模式中，stdout 是 JSON-RPC 通道。Server 日志必须写入 std
 
 本地 Server 从四个工具增加到五个工具时，Agent 通过 `list_tools()` 自动发现 `list_dir`，无需修改 Agent 循环或手写 schema。
 
+后来加 `sql_query` 又验证了一次，而且这次是**隔着协议**：`mcp_server.py` 里只多了一个 `@mcp.tool()`，`mcp_agent.py` 一行没改，`list_tools()` 就多出一个带完整表结构说明的工具，模型直接能用。
+同一份工具在另外三条链路里要分别改 schema（手写版）、改角色白名单（多智能体）——**这就是「工具与 Agent 解耦」在代码量上的差别**。
+
 接入官方 filesystem Server 后，同一个 Agent 可以获得目录列表等额外能力。这个对照说明的是**工具边界变化**，不是模型能力突然提升。
+
+### 只读不是靠关键词黑名单
+
+`sql_query` 不做「看到 DELETE 就拒绝」这种字符串匹配——改个大小写、塞个注释、写成 `WITH ... DELETE` 都能绕过去。真正的保证来自 SQLite 自己，三层：
+
+1. **连接级只读**：`file:...?mode=ro`，写操作由引擎直接拒绝；
+2. **authorizer**：只放行 `SELECT` / `READ` / `FUNCTION`（外加 `RECURSIVE` 支持 CTE），`PRAGMA`、`ATTACH`、`CREATE` 这类不写数据但能改会话状态的操作也一并挡掉；
+3. **结果集截断**：`fetchmany(51)`，一条 `SELECT *` 不会把上下文塞满。
+
+这里没有用户可传的 SQL 参数，所以谈不上参数化；防的是「模型写错或写野」，不是「外部注入」。错误统一转成 `ValueError` 回灌，模型能拿到 `no such table: xxx` 自己改。
 
 ### 编排的失效不是「派错人」，是「派对了人，他顺手把别人的活干了」
 
@@ -104,4 +118,5 @@ MCP stdio 模式中，stdout 是 JSON-RPC 通道。Server 日志必须写入 std
 - 并发工具调用、网络重试和远程 MCP 部署。
 - 大样本生成质量评估。
 - 文件工具的权限控制与恶意输入安全测试。
+- `sql_query` 只做了只读和行数上限，没有行级权限、审计日志和慢查询超时。
 - 多智能体只做了 supervisor 单层调度，没有并行分支、层级嵌套和多轮协商。

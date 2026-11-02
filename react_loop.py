@@ -9,7 +9,7 @@ import requests
 from dotenv import load_dotenv
 
 from context import trim_by_turn
-from tools_core import BASE_DIR, dispatch, safe_args
+from tools_core import BASE_DIR, SQL_TOOL_DOC, dispatch, safe_args
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -84,6 +84,20 @@ TOOLS_SCHEMA = [
                 "type": "object",
                 "properties": {"path": {"type": "string", "description": "目录路径，默认当前目录"}},
                 "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "sql_query",
+            "description": SQL_TOOL_DOC,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sql": {"type": "string", "description": "一条 SQLite SELECT 语句，只读"}
+                },
+                "required": ["sql"],
             },
         },
     },
@@ -182,6 +196,7 @@ def main() -> None:
         ("用例2 错误回灌", "读一下 not_exist.txt，告诉我里面写了什么", MAX_STEPS),
         ("用例3 单步", "现在几点了？", MAX_STEPS),
         ("用例4 轮数上限", "查一下北京天气，然后把温度和 10 相加", 1),
+        ("用例5 查库", "哪个品类卖得最好？销售额是多少", MAX_STEPS),
     ]
     for title, question, limit in cases:
         print("\n" + "=" * 55)

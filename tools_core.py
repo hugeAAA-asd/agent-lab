@@ -3,11 +3,26 @@
 import ast
 import json
 import operator
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
 BASE_DIR = Path(__file__).parent
+DB_PATH = BASE_DIR / "data" / "demo.db"
+SQL_MAX_ROWS = 50
+
+# 工具的说明文字只有一份：React/LangGraph 的 tools schema 和 MCP Server 的
+# description 都引它，避免「模型看到的表结构」和「真实表结构」各写一遍。
+SQL_TOOL_DOC = (
+    "在只读演示电商库（SQLite）上执行一条查询，只允许单条 SELECT / WITH，最多返回 50 行。\n"
+    "表 products(id, name, category, price, stock)：商品、品类、单价、库存\n"
+    "表 orders(id, order_no, city, product_id, qty, amount, status, created_at)：订单\n"
+    "  - product_id 关联 products.id，问「品类」要 JOIN products\n"
+    "  - status 取值 paid 已付款 / refunded 已退款 / pending 待付款\n"
+    "  - amount 是订单实付金额，qty 是件数\n"
+    "问哪个品类卖得最好、退款多少单、哪些商品库存不足时用它，不要凭记忆编数字。"
+)
 
 _BINARY_OPERATORS: dict[type[ast.operator], Callable[[float, float], float]] = {
     ast.Add: operator.add,
@@ -91,6 +106,66 @@ def list_dir(path: str = ".") -> str:
     return "、".join(item.name for item in candidate.iterdir())
 
 
+_READ_ACTIONS = {
+    sqlite3.SQLITE_SELECT,
+    sqlite3.SQLITE_READ,
+    sqlite3.SQLITE_FUNCTION,
+    getattr(sqlite3, "SQLITE_RECURSIVE", 33),  # WITH RECURSIVE 需要
+}
+
+
+def _only_read(action: int, *_args: Any) -> int:
+    """authorizer 回调：只放行「读表」和「调函数」，其余一律拒绝。
+
+    `mode=ro` 已经在连接层挡住了写入，这一层是第二道闸：
+    PRAGMA、ATTACH、CREATE 这类不写数据但能改会话状态的操作也一起挡掉。
+    """
+    return sqlite3.SQLITE_OK if action in _READ_ACTIONS else sqlite3.SQLITE_DENY
+
+
+def _cell(value: Any) -> str:
+    """把单元格转成短文本；整数形态的浮点不显示 .0。"""
+    if value is None:
+        return "NULL"
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def sql_query(sql: str) -> str:
+    """在只读演示库上执行单条 SELECT，最多返回 50 行。"""
+    if not sql or not sql.strip():
+        raise ValueError("sql 不能为空")
+    if not DB_PATH.exists():
+        # clone 下来第一次调用就建库，省掉一步手工初始化
+        from scripts.init_db import build
+
+        build()
+
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    try:
+        conn.set_authorizer(_only_read)
+        cursor = conn.execute(sql)
+        columns = [item[0] for item in cursor.description or []]
+        if not columns:
+            raise ValueError("这条语句没有返回结果集，只支持 SELECT / WITH 查询")
+        rows = cursor.fetchmany(SQL_MAX_ROWS + 1)
+    except sqlite3.Error as exc:
+        # 语法错、表名错、越权写：都当成可回灌的输入错误，让模型自己改 SQL
+        raise ValueError(f"SQL 执行失败：{exc}") from exc
+    finally:
+        conn.close()
+
+    if not rows:
+        return "查询成功，但没有匹配的行。"
+
+    lines = [" | ".join(columns)]
+    lines.extend(" | ".join(_cell(value) for value in row) for row in rows[:SQL_MAX_ROWS])
+    if len(rows) > SQL_MAX_ROWS:
+        lines.append(f"（结果超过 {SQL_MAX_ROWS} 行，只返回前 {SQL_MAX_ROWS} 行）")
+    return "\n".join(lines)
+
+
 def dispatch(name: str, args: dict[str, Any]) -> str:
     """按工具名调用本地实现；未知工具抛出 ValueError。"""
     table = {
@@ -99,6 +174,7 @@ def dispatch(name: str, args: dict[str, Any]) -> str:
         "get_weather": lambda a: get_weather(a.get("city", "")),
         "read_file": lambda a: read_file(a.get("path", "")),
         "list_dir": lambda a: list_dir(a.get("path", ".")),
+        "sql_query": lambda a: sql_query(a.get("sql", "")),
     }
     function = table.get(name)
     if function is None:
