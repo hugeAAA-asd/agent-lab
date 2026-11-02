@@ -8,3 +8,7 @@ select = ["E4", "E7", "E9", "F", "I"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+# 让 pytest 把仓库根加入 sys.path，使测试里的 `import react_loop` 等顶层导入
+# 在「裸 pytest 入口」和「python -m pytest」两种调用方式下都能工作。
+# 否则 GitHub Actions 用裸 `pytest` 会因找不到项目模块而收集失败（exit code 2）。
+pythonpath = ["."]
