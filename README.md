@@ -1,78 +1,107 @@
 # agent-lab
 
-从零手写 Agent 的最小闭环，写了三遍：**ReAct 循环 → LangGraph 状态图 → MCP 协议接入**。
+用同一个工具集实现三条 Agent 执行链路：**手写 ReAct → LangGraph 状态图 → MCP 协议接入**。项目重点不是堆叠框架，而是对比循环控制、状态管理和工具解耦分别由哪一层负责。
 
-不是调框架 API 的 demo。目的是搞清楚每一层到底在做什么、哪一层负责什么、换掉一层会发生什么。
+## 实现对照
 
-## 三级实现
-
-| 阶段 | 文件 | 做了什么 |
+| 实现 | 入口 | 核心问题 |
 |---|---|---|
-| 1. 手写循环 | `react_loop.py` | 不用任何框架，直接调 chat/completions：工具 schema、`tool_calls` 解析、结果回灌、步数上限、异常转文本回灌 |
-| 2. 状态图 | `graph_agent.py` | 把同一个循环改写成 LangGraph 的 `StateGraph`：`agent` / `tools` 两个节点 + 条件边，对照「手写 while」和「图状态机」的差别 |
-| 3. 协议解耦 | `mcp_server.py` / `mcp_client.py` / `mcp_agent.py` | 把工具从代码里抽出来做成独立 MCP Server，Agent 侧运行时发现工具清单，`local` / `fs` 两个 Server 可切换 |
+| 手写 ReAct | `react_loop.py` | 解析 `tool_calls`、执行工具、回灌结果，直到模型给出最终回答 |
+| LangGraph | `graph_agent.py` | 将同一循环改写为 `agent` / `tools` 节点、条件边和共享状态 |
+| MCP Agent | `mcp_agent.py` | 运行时发现并调用外部 MCP Server 的工具，Agent 不硬编码工具清单 |
 
-辅助文件：`tools_core.py`（5 个工具的纯实现）、`warmup.py`（`dispatch` / `trim_messages` / `safe_args` 三块砖）、`rewrite.py`（重写练习）。
+`mcp_client.py` 用于单独观察 MCP 握手、工具发现和调用过程；`tools_core.py` 保存与模型、协议无关的本地工具实现；`context.py` 负责按完整回合裁剪消息。
 
-## 五个工具
+## 工具与可靠性设计
 
-`get_current_time` / `calculate` / `get_weather` / `read_file` / `list_dir`
+本地 MCP Server 提供五个演示工具：
 
-`calculate` 用字符白名单替代 `eval`，`read_file` 在文件不存在时抛异常——故意留出错误路径，用来验证错误回灌。
+- `get_current_time`：获取当前时间。
+- `calculate`：计算仅含数字和允许运算符的表达式，不开放任意代码执行。
+- `get_weather`：返回固定演示数据，不请求真实天气服务。
+- `read_file`：读取文本，最多返回 2000 个字符。
+- `list_dir`：列出目录内容。
 
-## 验收：4 组用例
+三条链路都包含以下边界处理：
 
-`验收记录.md` 里有完整实测输出，这里只列结论：
+- 工具异常转换为 `role=tool` 消息回灌，避免一次工具失败直接终止 Agent。
+- 通过最大模型调用轮数或 LangGraph `recursion_limit` 限制无限循环。
+- 按完整回合裁剪历史，避免孤立的 `tool` 消息找不到对应的 `assistant(tool_calls)`。
+- 模型因 `finish_reason="length"` 停止且没有工具调用时，明确返回截断提示。
 
-| 用例 | 验证什么 | 结果 |
-|---|---|---|
-| 多步任务 | 同一问题需要连调两个工具，顺序由模型决定而非写死 | 通过 |
-| 错误回灌 | 读不存在的文件，工具抛异常 | 异常被捕获转文本回灌，模型自行换策略，Agent 不崩 |
-| 单步 | 简单问题不应滥用工具 | 通过 |
-| 防死循环 | `max_steps=1` 问一个需要两步的问题 | 返回兜底文案，不无限循环 |
+这些机制只能降低失败风险，不能保证所有异常输入都能恢复。
 
-## 踩过的坑
+## 快速开始
 
-这些都是跑出来才发现的，不是查文档能查到的：
+要求：Python 3.11+。仅 `fs` 模式额外需要 Node.js 和 `npx`。
 
-- **`role=tool` 消息必须排在它的 `assistant` 之后。** `tool_call_id` 是模型在那条 assistant 的 `tool_calls` 里生成的，服务端会校验每条 tool 消息的 `tool_call_id` 在上文出现过。顺序反了直接 400，而且模型根本没收到请求——是服务端在发出前退件。
-- **DeepSeek 返回的 `reasoning_content` 不能原样回传。** 第二轮请求会报错，必须先从 message 里剔掉。
-- **工具异常不能往外抛。** 抛出去整个 Agent 就崩了；转成文本回灌，模型拿到错误信息后能换参数或换工具。
-- **按条数裁剪历史会把父子消息拆散。** 简单 `messages[-N:]` 可能切掉 assistant 只留下 tool，下一轮同样 400。已改为按「回合」裁剪（`group_by_turn` / `take_last` / `trim_by_turn`），见 `验收记录.md`。
-- **MCP Python SDK 2.x 里 `FastMCP` 已改名为 `MCPServer`**，字段也蛇形化了（`server_info` / `input_schema` / `is_error`），网上大量 1.x 教程照抄会报错。
-- **Windows 上 `npx` 必须写 `npx.cmd`。** `npx` 是脚本不是可执行文件，Python 的 `CreateProcess` 认不出，报 `WinError 2`。
+```bash
+python -m venv .venv
+# macOS / Linux
+source .venv/bin/activate
+# Windows PowerShell
+# .venv\Scripts\Activate.ps1
 
-## 一个对照实验
+pip install -r requirements.txt
+cp .env.example .env  # 填入自己的 DEEPSEEK_API_KEY
+```
 
-`mcp_agent.py` 支持 `local` / `fs` 两个 Server：
+运行三种实现：
 
-- `local`：接入本仓库的 5 个工具
-- `fs`：接入官方 `@modelcontextprotocol/server-filesystem`（14 个工具，代码不在本仓库）
+```bash
+python react_loop.py          # 手写 ReAct
+python graph_agent.py         # LangGraph
+python mcp_agent.py local     # 本地 MCP Server
+python mcp_agent.py fs        # 官方 filesystem MCP Server，需要 Node.js
+```
 
-同一套循环、同一个模型，只换 Server，问「`not_exist.txt` 里写了什么」：
+单独检查 MCP 协议交互：
 
-- `local` → 模型答「我没有列目录的工具，无法确认」
-- `fs` → 模型先 `list_directory` 确认文件确实不存在，再回答
+```bash
+python mcp_client.py
+```
 
-**Agent 的能力边界由工具决定，不由提示词决定。** 这是这个仓库最想说明的一件事。
+> `fs` 模式会根据操作系统自动选择 `npx.cmd`（Windows）或 `npx`（其他系统）。
+
+## 自动化检查
+
+离线测试使用 mock，不请求模型接口，也不需要 API Key：
+
+```bash
+pip install -r requirements-dev.txt
+ruff check .
+ruff format --check .
+pytest
+```
+
+无需安装开发依赖的本地工具冒烟检查：
+
+```bash
+python -m scripts.smoke_test
+```
+
+验证范围和人工实验记录见 [`docs/verification.md`](docs/verification.md)，架构说明见 [`docs/architecture.md`](docs/architecture.md)。
+
+## 项目结构
+
+```text
+agent-lab/
+├── react_loop.py       # 手写 ReAct 循环
+├── graph_agent.py      # LangGraph 状态图
+├── mcp_agent.py        # 动态发现并调用 MCP 工具
+├── mcp_server.py       # 本地 MCP Server
+├── mcp_client.py       # MCP 协议验证客户端
+├── tools_core.py       # 纯工具实现与本地分发
+├── context.py          # 按回合裁剪消息
+├── docs/               # 架构与验证文档
+├── scripts/            # 离线冒烟检查
+└── tests/              # 不访问真实模型的自动化测试
+```
 
 ## 已知局限
 
-- 工具串行执行，没有并发
-- 裁剪以「回合」为最小单位，所以结果可能超过 `KEEP_MSG` 条（按组取整，宁可多留也不拆）
-- 无流式输出
-- 天气工具是假数据，未接真实 API
-- 无持久化记忆
-
-## 运行
-
-```bash
-python -m venv .venv && source .venv/bin/activate    # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-
-cp .env.example .env    # 填入 DEEPSEEK_API_KEY
-
-python react_loop.py    # 手写循环，跑 4 组用例
-python graph_agent.py   # LangGraph 版本
-python mcp_agent.py     # 接 MCP Server（需要 Node，用于 fs 模式）
-```
+- 工具串行执行，没有并发、缓存或持久化记忆。
+- 上下文按完整回合取整，消息数可能超过 `KEEP_MSG`；尚未按 token 数裁剪。
+- 没有流式输出、权限确认和生产级沙箱；文件工具仅适合本地演示。
+- 天气为固定数据；模型生成结果具有随机性，人工用例不代表稳定准确率。
+- 仅在 Windows 与当前 Python 3.12 环境做过人工验证，其他平台主要依赖 CI 的离线检查。

@@ -1,122 +1,34 @@
-"""react_loop.py —— 真正的 ReAct 循环（完整版，先跑通再动手改）
+"""不依赖 Agent 框架的 ReAct 循环。运行：python react_loop.py"""
 
-和 py_project01/main.py 的三个区别：
-  1. 有真正的循环：工具结果回灌后继续调模型，直到模型不再要工具
-  2. 有 MAX_STEPS：防止死循环烧钱
-  3. 工具异常会被捕获、作为 tool 消息回灌——Agent 不会崩
-
-运行：python react_loop.py
-"""
-
+import logging
 import os
 import sys
-import json
+from typing import Any
+
 import requests
-from datetime import datetime
-from pathlib import Path
 from dotenv import load_dotenv
+
+from context import trim_by_turn
+from tools_core import BASE_DIR, dispatch, safe_args
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
-BASE_DIR = Path(__file__).parent
 load_dotenv(BASE_DIR / ".env")
-
 API_KEY = os.getenv("DEEPSEEK_API_KEY")
-if not API_KEY:
-    raise SystemExit("错误：.env 里没有 DEEPSEEK_API_KEY（先从 py_project01 复制一份）")
-
 URL = "https://api.deepseek.com/v1/chat/completions"
-HEADERS = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
 MODEL = "deepseek-flash"
+MAX_STEPS = 6
+KEEP_MSG = 12
 
-MAX_STEPS = 6     # 最多几轮「模型 → 工具 → 模型」
-KEEP_MSG = 12     # 历史消息保留条数（不含 system）
+logger = logging.getLogger(__name__)
 
-
-# ==================== 三块砖：就是你 warmup 里写过的那三个 ====================
-def dispatch(name, args):
-    table = {
-        "get_current_time": lambda a: get_current_time(),
-        "calculate":        lambda a: calculate(a.get("expr", "")),
-        "get_weather":      lambda a: get_weather(a.get("city", "")),
-        "read_file":        lambda a: read_file(a.get("path", "")),
-    }
-    fn = table.get(name)
-    if fn is None:
-        raise ValueError(f"未知工具: {name}")
-    return fn(args)
-
-def group_by_turn(messages):
-    groups = []
-    for m in messages:
-        if m["role"] == "tool":
-           groups[-1].append(m)       # 丢进上一组
-        else:
-            groups.append([m])      # 自己开一组
-    return groups
-
-def take_last(groups, keep):
-    count = 0
-    picked = []
-    for i in reversed(groups):
-        if count >= keep:
-            break
-        picked = i + picked
-        count += len(i)
-    return picked
-
-def trim_by_turn(messages, keep):
-    system = messages[0]                    # 第一条单独拎出来
-    groups = group_by_turn(messages[1:])          # 剩下的分组
-    picked = take_last(groups,keep)              # 从后往前取够 keep 条
-    return [system] + picked
-
-
-def safe_args(raw):
-    try:
-        args = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        return {}
-    if not isinstance(args, dict):
-        return {}
-    return args
-
-
-# ==================== 4 个工具的真实实现 ====================
-def get_current_time():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-ALLOWED_CHARS = set("0123456789+-*/().% ")
-
-
-def calculate(expr: str):
-    """eval 白名单版：只允许数字和四则运算符（原项目直接 eval，可执行任意代码）"""
-    if not expr:
-        raise ValueError("expr 不能为空")
-    if not set(expr) <= ALLOWED_CHARS:
-        raise ValueError(f"表达式含非法字符，只支持 + - * / ( ) . %：{expr}")
-    return str(eval(expr, {"__builtins__": {}}, {}))
-
-
-def get_weather(city: str):
-    """假数据版，真实项目换成和风天气 API。接口稳定才能专心练循环。"""
-    if not city:
-        raise ValueError("city 不能为空")
-    fake = {"西安": "晴 26℃", "北京": "多云 18℃", "上海": "小雨 22℃"}
-    return fake.get(city, f"{city}: 暂无数据")
-
-
-def read_file(path: str):
-    """真读本地文件——文件不存在时会抛异常，正好用来测错误回灌"""
-    p = Path(path)
-    if not p.is_absolute():
-        p = BASE_DIR / p
-    if not p.exists():
-        raise FileNotFoundError(f"文件不存在: {p}")
-    return p.read_text(encoding="utf-8", errors="replace")[:2000]
-
+SYSTEM_PROMPT = """你是一个会使用工具的助手。
+规则：
+1. 需要实时信息或计算时必须调用工具，禁止凭记忆编造。
+2. 一次只推进一步，拿到工具结果后再决定下一步。
+3. 工具返回错误时，分析原因、换参数或换方式，不要重复同一个调用。
+4. 信息齐了再给最终答案，最终答案要简短，不要复述中间过程。"""
 
 TOOLS_SCHEMA = [
     {
@@ -143,10 +55,10 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "get_weather",
-            "description": "查询指定城市的天气",
+            "description": "查询指定城市的演示天气",
             "parameters": {
                 "type": "object",
-                "properties": {"city": {"type": "string", "description": "城市名，如 西安"}},
+                "properties": {"city": {"type": "string", "description": "城市名，如西安"}},
                 "required": ["city"],
             },
         },
@@ -155,7 +67,7 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "读取当前目录下的文本文件内容",
+            "description": "读取本地文本文件，最多返回 2000 个字符",
             "parameters": {
                 "type": "object",
                 "properties": {"path": {"type": "string", "description": "文件名或路径"}},
@@ -163,55 +75,66 @@ TOOLS_SCHEMA = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_dir",
+            "description": "列出指定目录中的直接子项",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": "目录路径，默认当前目录"}},
+                "required": [],
+            },
+        },
+    },
 ]
 
 
-# ==================== 调模型 ====================
-SYSTEM_PROMPT = """你是一个会使用工具的助手。
-规则：
-1. 需要实时信息或计算时必须调用工具，禁止凭记忆编造。
-2. 一次只推进一步，拿到工具结果后再决定下一步。
-3. 工具返回错误时，分析原因、换参数或换方式，不要重复同一个调用。
-4. 信息齐了再给最终答案，最终答案要简短，不要复述中间过程。"""
+def call_llm(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    """请求 DeepSeek chat/completions；仅在实际调用时要求 API Key。"""
+    if not API_KEY:
+        raise RuntimeError("未配置 DEEPSEEK_API_KEY，请复制 .env.example 为 .env 后填写")
+    response = requests.post(
+        URL,
+        json={
+            "model": MODEL,
+            "messages": messages,
+            "temperature": 0.3,
+            "tools": TOOLS_SCHEMA,
+            "tool_choice": "auto",
+        },
+        headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
+        timeout=60,
+    )
+    response.raise_for_status()
+    return response.json()
 
 
-def call_llm(messages):
-    body = {
-        "model": MODEL,
-        "messages": messages,
-        "temperature": 0.3,
-        "tools": TOOLS_SCHEMA,
-        "tool_choice": "auto",
-    }
-    r = requests.post(URL, json=body, headers=HEADERS, timeout=60)
-    r.raise_for_status()
-    return r.json()
-
-
-# ==================== 执行一批工具，返回要回灌的消息 ====================
-def run_tools(tool_calls):
+def run_tools(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """串行执行工具，并将异常文本回灌为对应的 tool 消息。"""
     results = []
-    for tc in tool_calls:
-        name = tc["function"]["name"]
-        args = safe_args(tc["function"]["arguments"])
+    for tool_call in tool_calls:
+        name = tool_call["function"]["name"]
+        args = safe_args(tool_call["function"].get("arguments"))
         print(f"  → 调用 {name}({args})")
         try:
-            out = str(dispatch(name, args))
-        except Exception as e:
-            # 关键：异常不往外抛，转成文本回灌给模型
-            out = f"工具执行失败: {type(e).__name__}: {e}"
-            print(f"  ! 异常已捕获，回灌给模型")
-        print(f"  ← {out[:120]}")
-        results.append({
-            "role": "tool",
-            "tool_call_id": tc["id"],
-            "content": out,
-        })
+            output = str(dispatch(name, args))
+        except Exception as exc:  # 工具错误是 Agent 的输入，不应直接终止循环
+            logger.warning("工具 %s 执行失败: %s", name, exc)
+            output = f"工具执行失败: {type(exc).__name__}: {exc}"
+        print(f"  ← {output[:120]}")
+        results.append(
+            {
+                "role": "tool",
+                "tool_call_id": tool_call["id"],
+                "content": output,
+            }
+        )
     return results
 
 
-# ==================== 主循环：这就是 ReAct ====================
-def run(user_input, max_steps=MAX_STEPS):
+def run(user_input: str, max_steps: int = MAX_STEPS) -> str:
+    """执行至多 max_steps 次模型调用，返回最终回答或明确的兜底提示。"""
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_input},
@@ -220,40 +143,39 @@ def run(user_input, max_steps=MAX_STEPS):
     for step in range(1, max_steps + 1):
         messages = trim_by_turn(messages, KEEP_MSG)
         data = call_llm(messages)
-        finish = data["choices"][0].get("finish_reason")
-        msg = data["choices"][0]["message"]
-        msg.pop("reasoning_content", None)      # DeepSeek 特有字段，回传会报错
+        choice = data["choices"][0]
+        finish_reason = choice.get("finish_reason")
+        message = dict(choice["message"])
+        message.pop("reasoning_content", None)  # DeepSeek 扩展字段不能原样回传
 
-        tool_calls = msg.get("tool_calls")
+        tool_calls = message.get("tool_calls")
         if not tool_calls:
-            print(f"[step {step}] finish_reason = {finish}")
-            if finish == "length":
+            print(f"[step {step}] finish_reason = {finish_reason}")
+            if finish_reason == "length":
                 return "【截断】回答超出长度上限，只生成了一部分。请把问题拆小一点。"
-            return msg.get("content") or "(空)"
+            return message.get("content") or "(空)"
 
         print(f"[step {step}] 模型要求调用 {len(tool_calls)} 个工具")
-        messages.append(msg)                     # 必须先把 assistant 消息放进历史
-        messages.extend(run_tools(tool_calls))   # 再把工具结果接在后面
+        messages.append(message)
+        messages.extend(run_tools(tool_calls))
 
     return f"【兜底】已用满 {max_steps} 步仍未得到最终答案。请换个问法，或把任务拆小一点。"
 
 
-
+def main() -> None:
+    """运行四个人工演示用例；需要有效 API Key。"""
+    cases = [
+        ("用例1 多步", "查一下西安天气，然后算一下 25*4+10", MAX_STEPS),
+        ("用例2 错误回灌", "读一下 not_exist.txt，告诉我里面写了什么", MAX_STEPS),
+        ("用例3 单步", "现在几点了？", MAX_STEPS),
+        ("用例4 轮数上限", "查一下北京天气，然后把温度和 10 相加", 1),
+    ]
+    for title, question, limit in cases:
+        print("\n" + "=" * 55)
+        print(f"{title}：{question}")
+        print("=" * 55)
+        print("答案:", run(question, max_steps=limit))
 
 
 if __name__ == "__main__":
-    cases = [
-        ("用例1 多步", "查一下西安天气，然后算一下 25*4+10"),
-        ("用例2 错误回灌", "读一下 not_exist.txt 这个文件，告诉我里面写了什么"),
-        ("用例3 单步", "现在几点了？"),
-    ]
-    for title, q in cases:
-        print("\n" + "=" * 55)
-        print(f"{title}：{q}")
-        print("=" * 55)
-        print("答案:", run(q))
-
-    print("\n" + "=" * 55)
-    print("用例4 防死循环：MAX_STEPS=1，问一个需要两步的问题")
-    print("=" * 55)
-    print("答案:", run("查一下北京天气，然后把温度和 10 相加", max_steps=1))
+    main()

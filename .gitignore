@@ -3,6 +3,11 @@
 __pycache__/
 *.pyc
 .idea/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
-# 临时练习草稿
+# 临时练习草稿与个人学习笔记，不进入公开仓库
 write.py
+字段对照表.md

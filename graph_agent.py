@@ -1,318 +1,102 @@
-"""graph_agent.py —— LangGraph 版 ReAct 循环（和 react_loop.py 做同一件事）
+"""用 LangGraph 状态图实现与 react_loop.py 相同的 ReAct 闭环。"""
 
-和 py_project01/main.py 的三个区别：
-  1. 有真正的循环：工具结果回灌后继续调模型，直到模型不再要工具
-  2. 有 MAX_STEPS：防止死循环烧钱
-  3. 工具异常会被捕获、作为 tool 消息回灌——Agent 不会崩
-
-运行：python react_loop.py
-"""
-
-import os
 import sys
-import json
-import requests
-from datetime import datetime
-from pathlib import Path
-from dotenv import load_dotenv
+from typing import Annotated, Any, TypedDict
+
+from langgraph.errors import GraphRecursionError
+from langgraph.graph import END, START, StateGraph
+
+from context import trim_by_turn
+from react_loop import KEEP_MSG, MAX_STEPS, SYSTEM_PROMPT, call_llm, run_tools
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
-BASE_DIR = Path(__file__).parent
-load_dotenv(BASE_DIR / ".env")
 
-API_KEY = os.getenv("DEEPSEEK_API_KEY")
-if not API_KEY:
-    raise SystemExit("错误：.env 里没有 DEEPSEEK_API_KEY（先从 py_project01 复制一份）")
-
-URL = "https://api.deepseek.com/v1/chat/completions"
-HEADERS = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
-MODEL = "deepseek-flash"
-
-MAX_STEPS = 6     # 最多几轮「模型 → 工具 → 模型」
-KEEP_MSG = 12     # 历史消息保留条数（不含 system）
-
-
-# ==================== 三块砖：就是你 warmup 里写过的那三个 ====================
-def dispatch(name, args):
-    table = {
-        "get_current_time": lambda a: get_current_time(),
-        "calculate":        lambda a: calculate(a.get("expr", "")),
-        "get_weather":      lambda a: get_weather(a.get("city", "")),
-        "read_file":        lambda a: read_file(a.get("path", "")),
-    }
-    fn = table.get(name)
-    if fn is None:
-        raise ValueError(f"未知工具: {name}")
-    return fn(args)
-
-
-def group_by_turn(messages):
-    """把消息切成回合：assistant(tool_calls) + 它后面连续的 tool 算一组。"""
-    groups = []
-    for m in messages:
-        if m["role"] == "tool":
-            groups[-1].append(m)        # 丢进上一组
-        else:
-            groups.append([m])          # 自己开一组
-    return groups
-
-
-def take_last(groups, keep):
-    """从后往前按组捡，消息条数攒够 keep 就停，保持原顺序。"""
-    count = 0
-    picked = []
-    for g in reversed(groups):
-        if count >= keep:
-            break
-        picked = g + picked
-        count += len(g)
-    return picked
-
-
-def trim_by_turn(messages, keep):
-    """按回合裁剪：system 始终保留，assistant 和它的 tool 不会被拆开。
-
-    旧版 trim_messages 按条数一刀切（messages[-keep:]），会把
-    assistant(tool_calls) 和它后面的 tool 拆散，服务端按 tool_call_id
-    找不到父消息，直接 400。这里改成以「回合」为最小裁剪单位。
-    代价：结果可能超过 keep 条（按组取整，宁可多留也不拆）。
-    """
-    system = messages[0]
-    groups = group_by_turn(messages[1:])
-    picked = take_last(groups, keep)
-    return [system] + picked
-
-
-def safe_args(raw):
-    try:
-        args = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        return {}
-    if not isinstance(args, dict):
-        return {}
-    return args
-
-
-# ==================== 4 个工具的真实实现 ====================
-def get_current_time():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-ALLOWED_CHARS = set("0123456789+-*/().% ")
-
-
-def calculate(expr: str):
-    """eval 白名单版：只允许数字和四则运算符（原项目直接 eval，可执行任意代码）"""
-    if not expr:
-        raise ValueError("expr 不能为空")
-    if not set(expr) <= ALLOWED_CHARS:
-        raise ValueError(f"表达式含非法字符，只支持 + - * / ( ) . %：{expr}")
-    return str(eval(expr, {"__builtins__": {}}, {}))
-
-
-def get_weather(city: str):
-    """假数据版，真实项目换成和风天气 API。接口稳定才能专心练循环。"""
-    if not city:
-        raise ValueError("city 不能为空")
-    fake = {"西安": "晴 26℃", "北京": "多云 18℃", "上海": "小雨 22℃"}
-    return fake.get(city, f"{city}: 暂无数据")
-
-
-def read_file(path: str):
-    """真读本地文件——文件不存在时会抛异常，正好用来测错误回灌"""
-    p = Path(path)
-    if not p.is_absolute():
-        p = BASE_DIR / p
-    if not p.exists():
-        raise FileNotFoundError(f"文件不存在: {p}")
-    return p.read_text(encoding="utf-8", errors="replace")[:2000]
-
-
-TOOLS_SCHEMA = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_current_time",
-            "description": "获取当前日期和时间",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "calculate",
-            "description": "计算数学表达式，例如 25*4+10",
-            "parameters": {
-                "type": "object",
-                "properties": {"expr": {"type": "string", "description": "数学表达式"}},
-                "required": ["expr"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": "查询指定城市的天气",
-            "parameters": {
-                "type": "object",
-                "properties": {"city": {"type": "string", "description": "城市名，如 西安"}},
-                "required": ["city"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "读取当前目录下的文本文件内容",
-            "parameters": {
-                "type": "object",
-                "properties": {"path": {"type": "string", "description": "文件名或路径"}},
-                "required": ["path"],
-            },
-        },
-    },
-]
-
-
-# ==================== 调模型 ====================
-SYSTEM_PROMPT = """你是一个会使用工具的助手。
-规则：
-1. 需要实时信息或计算时必须调用工具，禁止凭记忆编造。
-2. 一次只推进一步，拿到工具结果后再决定下一步。
-3. 工具返回错误时，分析原因、换参数或换方式，不要重复同一个调用。
-4. 信息齐了再给最终答案，最终答案要简短，不要复述中间过程。"""
-
-
-def call_llm(messages):
-    body = {
-        "model": MODEL,
-        "messages": messages,
-        "temperature": 0.3,
-        "tools": TOOLS_SCHEMA,
-        "tool_choice": "auto",
-    }
-    r = requests.post(URL, json=body, headers=HEADERS, timeout=60)
-    r.raise_for_status()
-    return r.json()
-
-
-# ==================== 执行一批工具，返回要回灌的消息 ====================
-def run_tools(tool_calls):
-    results = []
-    for tc in tool_calls:
-        name = tc["function"]["name"]
-        args = safe_args(tc["function"]["arguments"])
-        print(f"  → 调用 {name}({args})")
-        try:
-            out = str(dispatch(name, args))
-        except Exception as e:
-            # 关键：异常不往外抛，转成文本回灌给模型
-            out = f"工具执行失败: {type(e).__name__}: {e}"
-            print(f"  ! 异常已捕获，回灌给模型")
-        print(f"  ← {out[:120]}")
-        results.append({
-            "role": "tool",
-            "tool_call_id": tc["id"],
-            "content": out,
-        })
-    return results
-
-
-# ==================== 主循环：这就是 ReAct ====================
-
-
-# ==================== 上面全部和 react_loop.py 一模一样 ====================
-# 从这里开始才是 LangGraph。注意：4 个工具、call_llm、run_tools 一行都没改。
-
-from typing import Annotated, TypedDict
-from langgraph.graph import StateGraph, START, END
-from langgraph.errors import GraphRecursionError
-
-
-def append_messages(left, right):
-    """reducer：节点返回的新消息，怎么合并进 state。这里是简单追加。"""
+def append_messages(
+    left: list[dict[str, Any]], right: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """LangGraph reducer：将节点产生的新消息追加到共享状态。"""
     return left + right
 
 
 class AgentState(TypedDict):
-    """图的「共享内存」：只有一个字段，就是消息列表"""
-    messages: Annotated[list, append_messages]
+    """图的共享状态。"""
+
+    messages: Annotated[list[dict[str, Any]], append_messages]
 
 
-def agent_node(state):
-    """节点 A：调模型。输入 state，输出要追加的消息。"""
+def agent_node(state: AgentState) -> dict[str, list[dict[str, Any]]]:
+    """调用模型，并返回需要追加的一条 assistant 消息。"""
     messages = trim_by_turn(state["messages"], KEEP_MSG)
     data = call_llm(messages)
-    msg = data["choices"][0]["message"]
-    msg.pop("reasoning_content", None)
-    n = len(msg.get("tool_calls") or [])
-    print(f"  [agent] 返回：content={repr(msg.get('content'))[:20]} tool_calls={n}")
-    return {"messages": [msg]}
+    choice = data["choices"][0]
+    message = dict(choice["message"])
+    message.pop("reasoning_content", None)
+
+    tool_calls = message.get("tool_calls") or []
+    print(f"  [agent] content={repr(message.get('content'))[:20]} tool_calls={len(tool_calls)}")
+    if not tool_calls and choice.get("finish_reason") == "length":
+        message["content"] = "【截断】回答超出长度上限，只生成了一部分。请把问题拆小一点。"
+    return {"messages": [message]}
 
 
-def tools_node(state):
-    """节点 B：执行工具。"""
+def tools_node(state: AgentState) -> dict[str, list[dict[str, Any]]]:
+    """执行最后一条 assistant 消息中声明的工具调用。"""
     last = state["messages"][-1]
     print(f"  [tools] 执行 {len(last['tool_calls'])} 个工具")
     return {"messages": run_tools(last["tool_calls"])}
 
 
-def should_continue(state):
-    """条件边：决定 agent 之后去哪。这就是你手写的那个 if。"""
-    last = state["messages"][-1]
-    if last.get("tool_calls"):
-        return "tools"
-    return END
+def should_continue(state: AgentState) -> str:
+    """有工具调用时进入 tools，否则结束图执行。"""
+    return "tools" if state["messages"][-1].get("tool_calls") else END
 
 
 def build_graph():
-    g = StateGraph(AgentState)
-    g.add_node("agent", agent_node)
-    g.add_node("tools", tools_node)
-
-    g.add_edge(START, "agent")
-    g.add_conditional_edges("agent", should_continue, {"tools": "tools", END: END})
-    g.add_edge("tools", "agent")          # 工具跑完回 agent，这就是循环
-
-    return g.compile()
+    """构建 agent → tools → agent 的状态图。"""
+    graph = StateGraph(AgentState)
+    graph.add_node("agent", agent_node)
+    graph.add_node("tools", tools_node)
+    graph.add_edge(START, "agent")
+    graph.add_conditional_edges("agent", should_continue, {"tools": "tools", END: END})
+    graph.add_edge("tools", "agent")
+    return graph.compile()
 
 
 APP = build_graph()
 
 
-def run_graph(user_input, max_steps=MAX_STEPS):
-    """对外接口：和 react_loop.run() 的签名、返回值保持一致"""
-    init = [
+def run_graph(user_input: str, max_steps: int = MAX_STEPS) -> str:
+    """运行状态图；recursion_limit 按节点数换算，而不是直接等同业务轮数。"""
+    initial_messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_input},
     ]
     try:
         result = APP.invoke(
-            {"messages": init},
+            {"messages": initial_messages},
             {"recursion_limit": max_steps * 2 + 1},
         )
         return result["messages"][-1].get("content") or "(空)"
     except GraphRecursionError:
-        return f"【兜底】达到 max_steps={max_steps} 上限，LangGraph 帮你拦住了"
+        return f"【兜底】达到 max_steps={max_steps} 上限，LangGraph 已终止图执行"
+
+
+def main() -> None:
+    """运行与手写版一致的人工演示用例。"""
+    cases = [
+        ("用例1 多步", "查一下西安天气，然后算一下 25*4+10", MAX_STEPS),
+        ("用例2 错误回灌", "读一下 not_exist.txt，告诉我里面写了什么", MAX_STEPS),
+        ("用例3 单步", "现在几点了？", MAX_STEPS),
+        ("用例4 轮数上限", "查一下北京天气，然后把温度和 10 相加", 1),
+    ]
+    for title, question, limit in cases:
+        print("\n" + "=" * 55)
+        print(f"{title}：{question}")
+        print("=" * 55)
+        print("答案:", run_graph(question, max_steps=limit))
 
 
 if __name__ == "__main__":
-    cases = [
-        ("用例1 多步", "查一下西安天气，然后算一下 25*4+10"),
-        ("用例2 错误回灌", "读一下 not_exist.txt 这个文件，告诉我里面写了什么"),
-        ("用例3 单步", "现在几点了？"),
-    ]
-    for title, q in cases:
-        print("\n" + "=" * 55)
-        print(f"{title}：{q}")
-        print("=" * 55)
-        print("答案:", run_graph(q))
-
-    print("\n" + "=" * 55)
-    print("用例4 防死循环：max_steps=1")
-    print("=" * 55)
-    print("答案:", run_graph("查一下北京天气，然后把温度和 10 相加", max_steps=1))
+    main()

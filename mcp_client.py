@@ -1,9 +1,4 @@
-"""mcp_client.py —— MCP 客户端：拉起 Server 进程，列工具，逐个调用
-
-这一步是整个 MCP 学习里最关键的一步，因为它让你亲眼看到：
-  · 工具列表**不是写死在 Agent 代码里的**，是运行时从 Server 拉回来的
-  · 调用工具**不是本地函数调用**，是发一条 JSON-RPC 过去、等结果回来
-  · 而且 Server 是**另一个进程**（这里是子进程，远程就是一个 URL）
+"""启动本地 MCP Server，验证握手、工具发现、调用与 schema 转换。
 
 运行：python mcp_client.py
 """
@@ -27,9 +22,7 @@ SERVER_SCRIPT = BASE_DIR / "mcp_server.py"
 
 
 def make_server_params():
-    """告诉客户端：怎么启动这个 Server。
-    注意 command 用的是当前 venv 的 python，不是系统 python——不然找不到 mcp 包。
-    """
+    """使用当前 Python 环境启动 Server，避免子进程找不到 mcp 包。"""
     return StdioServerParameters(
         command=sys.executable,
         args=[str(SERVER_SCRIPT)],
@@ -71,14 +64,12 @@ async def main():
                 ("get_current_time", {}),
                 ("calculate", {"expr": "25*4+10"}),
                 ("get_weather", {"city": "西安"}),
-                ("read_file", {"path": "not_exist.txt"}),          # 故意失败：看错误怎么回来
-                ("calculate", {"expr": "__import__('os')"}),        # 故意非法：看白名单拦不拦
+                ("read_file", {"path": "not_exist.txt"}),  # 故意失败：看错误怎么回来
+                ("calculate", {"expr": "__import__('os')"}),  # 故意非法：看白名单拦不拦
             ]
             for name, args in cases:
                 result = await session.call_tool(name, args)
-                text = " | ".join(
-                    getattr(c, "text", str(c)) for c in (result.content or [])
-                )
+                text = " | ".join(getattr(c, "text", str(c)) for c in (result.content or []))
                 flag = "ERROR" if getattr(result, "is_error", False) else "OK   "
                 print(f"[{flag}] {name}({json.dumps(args, ensure_ascii=False)})")
                 print(f"        -> {text}")
@@ -93,14 +84,9 @@ async def main():
 
 
 def to_openai_tools(mcp_tools):
-    """MCP Tool -> OpenAI function calling schema
+    """将 MCP 工具描述转换为 OpenAI function calling schema。
 
-    两边结构其实几乎一样，差别只有外层包了一层：
-        MCP:    {name, description, inputSchema}
-        OpenAI: {"type": "function", "function": {name, description, parameters}}
-    所以这个函数就是「改个壳」。面试问「MCP 和 function calling 什么关系」，
-    答案就在这 8 行里：**MCP 管工具怎么被发现和调用，function calling 管模型怎么表达
-    「我要调它」。两者是上下层，不是竞品。**
+    MCP 负责工具发现与调用，function calling 负责模型表达调用意图。
     """
     return [
         {
